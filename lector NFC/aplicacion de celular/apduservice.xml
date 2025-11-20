@@ -1,0 +1,8 @@
+<host-apdu-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:description="@string/app_name"
+    android:requireDeviceUnlock="false">
+    <aid-group android:description="@string/app_name" android:category="other">
+        <!-- Este ID debe ser igual al del Arduino: F0010203040506 -->
+        <aid-filter android:name="F0010203040506"/>
+    </aid-group>
+</host-apdu-service>
