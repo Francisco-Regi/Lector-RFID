@@ -1,22 +1,25 @@
-from typing import List, Tuple, Optional
+from typing import Optional
 from modelo import Modelo
 from vistaprincipal import MainView
+from view_consulta import ConsultaView
 from service_rc522_serial import RC522SerialService
 from config import FILL_WITH_UID_IF_UNKNOWN
 import time
 
 class Controller:
     def __init__(self):
-        self.model = Modelo()
+        self.model = Modelo() # Se conecta a la base de datos
         self.view = MainView()
+        
+        # Conectamos los botones de la vista a funciones de este controlador
         self.view.on_guardar = self._on_guardar
         self.view.on_consulta = self._on_consulta
         
-        # Estado para controlar lecturas rápidas
+        # Variables para evitar lecturas dobles del mismo chip en poco tiempo
         self.last_processed_uid = None
         self.processing_start_time = 0
 
-        # Servicio serie
+        # Iniciamos la escucha del puerto Serial (Arduino)
         self.svc = RC522SerialService(
             on_uid=self._on_uid,
             on_payload=self._on_payload,
@@ -25,65 +28,65 @@ class Controller:
         self.svc.start()
 
     def _on_uid(self, uid: str):
-        # Evitar rebotes simples
+        # Lógica anti-rebote (3 segundos de espera entre lecturas de la misma tarjeta)
         if uid == self.last_processed_uid and (time.time() - self.processing_start_time) < 3.0:
             return
         
         self.last_processed_uid = uid
         self.processing_start_time = time.time()
-        
-        print(f"Procesando UID: {uid}")
+        print(f"--> UID Detectado: {uid}")
 
-        # 1) Buscar en DB local
+        # 1) Verificar si ya existe en la Base de Datos
         row = self.model.get_latest_by_uid(uid)
         if row:
-            nombre, correo, tel = row
-            self.view.after(0, lambda: self._append(uid, nombre, correo, tel, f"UID {uid} (Encontrado en DB)"))
+            # Si existe, recuperamos los datos (nombre, correo, tel, region)
+            nombre, correo, tel, region = row
+            if region is None: region = ""
+            
+            # Mostramos en la tabla indicando que vino de la BD
+            self.view.after(0, lambda: self._append(uid, nombre, correo, tel, region, f"UID {uid} (Encontrado en BD)"))
             return
 
-        # 2) Si no está en DB, esperamos los datos del Arduino (DATA:...)
-        # Le damos al usuario un mensaje visual de "Leyendo memoria..."
-        self.view.after(0, lambda: self.view.set_status(f"UID {uid} detectado. Esperando datos de memoria..."))
-        
-        # Iniciamos un timer: si en 2 segundos no llega DATA, asumimos que está vacía
-        self.view.after(2000, lambda: self._check_timeout(uid))
+        # 2) Si es nueva, avisamos que estamos esperando datos del chip NFC
+        self.view.after(0, lambda: self.view.set_status(f"Leyendo memoria del Tag {uid}..."))
 
     def _on_payload(self, uid: Optional[str], payload: dict):
-        # Si llega esto, el Arduino encontró texto en la tarjeta
         if not uid: return
         
-        # Actualizamos la vista inmediatamente
+        # Recibimos el JSON del Arduino con la información leída del chip
         nombre = (payload.get("nombre") or "").strip()
         correo = (payload.get("correo") or "").strip()
         tel    = (payload.get("telefono") or "").strip()
+        region = (payload.get("region") or "").strip() # Aquí recibimos la Lada (ej: +52)
         
-        if nombre or correo or tel:
-            self.view.after(0, lambda: self._append(uid, nombre, correo, tel, f"UID {uid} (Leído de Tarjeta)"))
+        if nombre or correo or tel or region:
+            print(f"--> Datos recibidos: {nombre}, Lada: {region}")
+            self.view.after(0, lambda: self._append(uid, nombre, correo, tel, region, f"UID {uid} (Leído del Tag)"))
+        else:
+            self.view.after(0, lambda: self.view.set_status(f"Tag {uid} vacío o sin formato."))
 
-    def _check_timeout(self, uid_checked):
-        # Si pasaron 2 segundos y no hemos actualizado la vista con datos reales (chequeo simple)
-        # Podrías mejorar esto con banderas, pero para simplificar:
-        # Si el usuario quiere, agregamos solo el UID
-        if FILL_WITH_UID_IF_UNKNOWN:
-            # Solo si no se ha llenado ya (aquí una lógica simple para no duplicar si llegó data justo antes)
-             pass # Dejamos que el usuario decida o implementamos lógica más compleja
-             # Por ahora, el status se queda en "Esperando..." hasta que el usuario quite la tarjeta
-        
-    def _append(self, uid: str, nombre: str, correo: str, tel: str, status: str):
-        self.view.add_row(uid, nombre, correo, tel)
+    def _append(self, uid: str, nombre: str, correo: str, tel: str, region: str, status: str):
+        # Agregamos a la tabla visual
+        self.view.add_row(uid, nombre, correo, tel, region)
         self.view.set_status(status)
 
     def _on_guardar(self):
         if not self.view.buffer:
-            self.view.set_status("No hay datos para guardar.")
+            self.view.set_status("No hay datos pendientes para guardar.")
             return
+        
+        # Guardamos todo el buffer en la BD
         n = self.model.save_many(self.view.buffer)
-        cerrar = self.view.ask_close_after_save()
-        self.view.clear_rows()
-        self.view.set_status(f"Guardados {n} registro(s).")
-        if cerrar: self.quit()
+        self.view.set_status(f"Se guardaron {n} registros.")
+        
+        # Preguntar si cerrar o limpiar
+        if self.view.ask_close_after_save():
+            self.quit()
+        else:
+            self.view.clear_rows()
 
     def _on_consulta(self):
+        # Abrimos la ventana de historial
         data = self.model.fetch_all()
         ConsultaView(self.view, data, on_export=lambda p: self.model.export_to_excel(p))
 
