@@ -70,20 +70,49 @@ class Controller:
         self.view.add_row(uid, nombre, correo, tel, region)
         self.view.set_status(status)
 
-    def _on_guardar(self):
-        if not self.view.buffer:
-            self.view.set_status("No hay datos pendientes para guardar.")
-            return
+    #// def _on_guardar(self):
+    #    if not self.view.buffer:
+    #        self.view.set_status("No hay datos pendientes para guardar.")
+    #        return
         
         # Guardamos todo el buffer en la BD
-        n = self.model.save_many(self.view.buffer)
-        self.view.set_status(f"Se guardaron {n} registros.")
+    #    n = self.model.save_many(self.view.buffer)
+    #    self.view.set_status(f"Se guardaron {n} registros.")
         
         # Preguntar si cerrar o limpiar
-        if self.view.ask_close_after_save():
-            self.quit()
-        else:
-            self.view.clear_rows()
+    #    if self.view.ask_close_after_save():
+    #        self.quit()
+    #    else:
+    #        self.view.clear_rows()
+    #
+
+    # --- Reemplaza esto en control.py ---
+    def _on_payload(self, uid: Optional[str], payload: dict):
+        if not uid: return
+        
+        # MODO DIAGNOSTICO: Mostrar qué llegó realmente
+        raw = payload.get("raw_content")
+        if raw:
+            print(f"CONTENIDO CRUDO DE LA TARJETA: {raw}")
+            # Intentar extraer datos manualmente del string crudo
+            # Buscamos patrones a mano por si el JSON falló
+            import re
+            nombre = ""
+            match = re.search(r"nombre:([a-zA-Z0-9\s]+)", raw)
+            if match: nombre = match.group(1)
+            
+            self.view.after(0, lambda: self._append(uid, f"RAW: {nombre}", "Ver consola", "...", f"UID {uid} (Leído)"))
+            return
+
+        # (El resto del código normal...)
+        nombre = (payload.get("nombre") or "").strip()
+        correo = (payload.get("correo") or "").strip()
+        tel    = (payload.get("telefono") or "").strip()
+        region = (payload.get("region") or "").strip()
+        
+        if nombre or correo or tel or region:
+            print(f"--> Datos recibidos: {nombre}, Lada: {region}")
+            self.view.after(0, lambda: self._append(uid, nombre, correo, tel, region, f"UID {uid} (Leído del Tag)"))
 
     def _on_consulta(self):
         # Abrimos la ventana de historial
