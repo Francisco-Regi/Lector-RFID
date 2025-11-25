@@ -19,7 +19,7 @@ void setup() {
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_SS);
   mfrc522.PCD_Init();
   for (byte i = 0; i < 6; i++) keyA.keyByte[i] = 0xFF;
-  Serial.println("RC522 listo - V4 con CRC");
+  Serial.println("RC522 listo - V5 CRC Activado");
 }
 
 String cleanString(String s) {
@@ -39,51 +39,48 @@ bool tryAndroidHCE() {
   byte responseLen = 255;
 
   // 1. Saludo (SELECT AID)
-  // IMPORTANTE: El ultimo parametro 'true' activa el chequeo CRC, obligatorio para Android
+  // ¡AQUI ESTABA EL ERROR! Cambiamos false por true para activar CRC
   MFRC522::StatusCode status = mfrc522.PCD_TransceiveData(
     SELECT_APDU, sizeof(SELECT_APDU),
     response, &responseLen,
     NULL, 0, true 
   );
 
-  if (status != MFRC522::STATUS_OK) {
-     // Descomenta esta linea si quieres ver si falla el saludo:
-     // Serial.println("DEBUG: HCE Select fallo (Error CRC o Timeout)");
-     return false; 
-  }
+  if (status != MFRC522::STATUS_OK) return false;
 
   // 2. Verificar respuesta 90 00 (OK)
   if (responseLen >= 2 && response[responseLen-2] == 0x90 && response[responseLen-1] == 0x00) {
-      Serial.println("DEBUG: HCE OK - Pidiendo datos...");
       
       byte dataResp[255];
       byte dataLen = 255;
       
       // 3. Pedir Datos
+      // AQUI TAMBIEN: CRC debe ser true
       status = mfrc522.PCD_TransceiveData(
         GET_DATA_CMD, sizeof(GET_DATA_CMD),
         dataResp, &dataLen,
-        NULL, 0, true // CRC true aqui tambien
+        NULL, 0, true
       );
 
       if (status == MFRC522::STATUS_OK) {
          String jsonRaw = "";
          for(int i=0; i < dataLen - 2; i++) jsonRaw += (char)dataResp[i];
          
-         Serial.print("UID:CELULAR_ANDROID"); 
-         Serial.println();
-         Serial.print("DATA:");
-         Serial.println(cleanString(jsonRaw));
-         return true;
-      } else {
-         Serial.println("DEBUG: Fallo GET_DATA");
+         // Imprimimos SOLO cuando tenemos datos reales para no ensuciar Python
+         if (jsonRaw.length() > 5) {
+             Serial.print("UID:CELULAR_ANDROID"); 
+             Serial.println();
+             Serial.print("DATA:");
+             Serial.println(cleanString(jsonRaw));
+             return true;
+         }
       }
   }
   return false;
 }
 
 void readAllMemory(byte* buffer, int& index, int maxLen) {
-  // Lógica para tarjetas físicas (Mifare/NTAG)
+  // Lógica para tarjetas físicas
   MFRC522::PICC_Type type = mfrc522.PICC_GetType(mfrc522.uid.sak);
   if (type == MFRC522::PICC_TYPE_MIFARE_UL) {
       for (byte page = 4; page < 30; page += 4) { 
@@ -122,20 +119,22 @@ void loop() {
   if (!mfrc522.PICC_IsNewCardPresent()) return;
   if (!mfrc522.PICC_ReadCardSerial()) return;
 
-  // 1. Intentar HCE (Celular)
+  // Prioridad 1: Intentar hablar con Android
   if (tryAndroidHCE()) {
      mfrc522.PICC_HaltA();
-     delay(2000);
+     delay(2000); // Espera larga para no leer muchas veces
      return;
   }
 
-  // 2. Si no es celular, intentar lectura normal
+  // Prioridad 2: Si falló, es tarjeta física
   String uid = "";
   for (byte i = 0; i < mfrc522.uid.size; i++) {
     if (mfrc522.uid.uidByte[i] < 0x10) uid += "0";
     uid += String(mfrc522.uid.uidByte[i], HEX);
   }
   uid.toUpperCase();
+  
+  // Imprimimos UID solo si NO es Android (para no duplicar)
   Serial.print("UID:"); Serial.println(uid);
 
   byte rawBuffer[512]; int rawIndex = 0;
