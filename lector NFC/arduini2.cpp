@@ -8,9 +8,10 @@
 #define PIN_MOSI 23
 
 MFRC522 mfrc522(PIN_SS, PIN_RST);
-MFRC522::MIFARE_Key keyA;
+MFRC522::MIFARE_Key keyDefault;
+MFRC522::MIFARE_Key keyNDEF;
 
-// CLAVE HCE (F0010203040506)
+// CLAVE HCE (Celular)
 byte SELECT_APDU[] = { 0x00, 0xA4, 0x04, 0x00, 0x07, 0xF0, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x00 };
 byte GET_DATA_CMD[] = { 0x80, 0xB0, 0x00, 0x00, 0x00 }; 
 
@@ -18,15 +19,22 @@ void setup() {
   Serial.begin(115200);
   SPI.begin(PIN_SCK, PIN_MISO, PIN_MOSI, PIN_SS);
   mfrc522.PCD_Init();
-  for (byte i = 0; i < 6; i++) keyA.keyByte[i] = 0xFF;
-  Serial.println("RC522 listo - V5 CRC Activado");
+  
+  // Preparamos las dos llaves posibles
+  for (byte i = 0; i < 6; i++) keyDefault.keyByte[i] = 0xFF; // Fabrica
+  
+  // Llave estandar NDEF (Mad)
+  keyNDEF.keyByte[0] = 0xD3; keyNDEF.keyByte[1] = 0xF7; keyNDEF.keyByte[2] = 0xD3;
+  keyNDEF.keyByte[3] = 0xF7; keyNDEF.keyByte[4] = 0xD3; keyNDEF.keyByte[5] = 0xF7;
+
+  Serial.println("RC522 listo - V6 Multi-Llave");
 }
 
 String cleanString(String s) {
   String out = "";
   for (unsigned int i = 0; i < s.length(); i++) {
     char c = s[i];
-    if (isAlphaNumeric(c) || c == ' ' || c == '.' || c == '@' || c == '-' || c == '_' || c == '+' || c == '{' || c == '}' || c == ':' || c == '"' || c == ',') {
+    if (isAlphaNumeric(c) || c == ' ' || c == '.' || c == '@' || c == '-' || c == '_' || c == '+' || c == '{' || c == '}' || c == ':' || c == '"' || c == ',' || c == '|') {
       out += c;
     }
   }
@@ -38,40 +46,21 @@ bool tryAndroidHCE() {
   byte response[255];
   byte responseLen = 255;
 
-  // 1. Saludo (SELECT AID)
-  // ¡AQUI ESTABA EL ERROR! Cambiamos false por true para activar CRC
-  MFRC522::StatusCode status = mfrc522.PCD_TransceiveData(
-    SELECT_APDU, sizeof(SELECT_APDU),
-    response, &responseLen,
-    NULL, 0, true 
-  );
-
+  // Saludo con CRC activado (true)
+  MFRC522::StatusCode status = mfrc522.PCD_TransceiveData(SELECT_APDU, sizeof(SELECT_APDU), response, &responseLen, NULL, 0, true);
   if (status != MFRC522::STATUS_OK) return false;
 
-  // 2. Verificar respuesta 90 00 (OK)
   if (responseLen >= 2 && response[responseLen-2] == 0x90 && response[responseLen-1] == 0x00) {
-      
       byte dataResp[255];
       byte dataLen = 255;
-      
-      // 3. Pedir Datos
-      // AQUI TAMBIEN: CRC debe ser true
-      status = mfrc522.PCD_TransceiveData(
-        GET_DATA_CMD, sizeof(GET_DATA_CMD),
-        dataResp, &dataLen,
-        NULL, 0, true
-      );
+      status = mfrc522.PCD_TransceiveData(GET_DATA_CMD, sizeof(GET_DATA_CMD), dataResp, &dataLen, NULL, 0, true);
 
       if (status == MFRC522::STATUS_OK) {
          String jsonRaw = "";
          for(int i=0; i < dataLen - 2; i++) jsonRaw += (char)dataResp[i];
-         
-         // Imprimimos SOLO cuando tenemos datos reales para no ensuciar Python
          if (jsonRaw.length() > 5) {
-             Serial.print("UID:CELULAR_ANDROID"); 
-             Serial.println();
-             Serial.print("DATA:");
-             Serial.println(cleanString(jsonRaw));
+             Serial.print("UID:CELULAR"); Serial.println();
+             Serial.print("DATA:"); Serial.println(cleanString(jsonRaw));
              return true;
          }
       }
@@ -79,29 +68,62 @@ bool tryAndroidHCE() {
   return false;
 }
 
+// Intenta leer un bloque con una llave especifica
+bool tryReadBlock(byte block, byte* buffer, MFRC522::MIFARE_Key key) {
+    MFRC522::StatusCode status;
+    // Autenticacion
+    status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, block, &key, &(mfrc522.uid));
+    if (status != MFRC522::STATUS_OK) return false;
+
+    // Lectura
+    byte size = 18;
+    status = mfrc522.MIFARE_Read(block, buffer, &size);
+    if (status != MFRC522::STATUS_OK) return false;
+    
+    return true;
+}
+
 void readAllMemory(byte* buffer, int& index, int maxLen) {
-  // Lógica para tarjetas físicas
   MFRC522::PICC_Type type = mfrc522.PICC_GetType(mfrc522.uid.sak);
-  if (type == MFRC522::PICC_TYPE_MIFARE_UL) {
+  
+  // --- ESTRATEGIA PARA TARJETAS MIFARE CLASSIC (Tarjetas Blancas/Llaveros) ---
+  if (type != MFRC522::PICC_TYPE_MIFARE_UL) {
+      for (byte sector = 1; sector <= 4; sector++) { 
+          byte trailer = sector * 4 + 3;
+          byte block = sector * 4; // Leemos el primer bloque del sector
+          
+          // Intento 1: Llave de Fabrica (FFFF...)
+          bool success = false;
+          if (mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailer, &keyDefault, &(mfrc522.uid)) == MFRC522::STATUS_OK) {
+             success = true;
+          } 
+          // Intento 2: Llave NDEF (D3F7...) - Si falló la anterior
+          else {
+             mfrc522.PICC_HaltA(); mfrc522.PCD_StopCrypto1(); // Reiniciar comunicacion para reintentar auth
+             mfrc522.PICC_WakeupA(buffer, &index); // Despertar de nuevo (truco tecnico)
+             mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailer, &keyNDEF, &(mfrc522.uid));
+             success = true; // Asumimos exito para intentar leer, si falla el read lo atrapa abajo
+          }
+
+          // Leemos los 3 bloques de datos del sector
+          for (byte i = 0; i < 3; i++) {
+             byte currentBlock = sector * 4 + i;
+             byte temp[18]; byte size = sizeof(temp);
+             if (mfrc522.MIFARE_Read(currentBlock, temp, &size) == MFRC522::STATUS_OK) {
+                for (byte j = 0; j < 16; j++) if (index < maxLen) buffer[index++] = temp[j];
+             }
+          }
+      }
+      mfrc522.PCD_StopCrypto1();
+  } 
+  // --- ESTRATEGIA PARA ULTRALIGHT (Stickers) ---
+  else {
       for (byte page = 4; page < 30; page += 4) { 
          byte temp[18]; byte size = sizeof(temp);
          if (mfrc522.MIFARE_Read(page, temp, &size) == MFRC522::STATUS_OK) {
             for(int i=0; i<16; i++) if (index < maxLen) buffer[index++] = temp[i];
          } else { break; }
       }
-  } else {
-      for (byte sector = 1; sector <= 4; sector++) { 
-          byte trailerBlock = sector * 4 + 3;
-          if (mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, trailerBlock, &keyA, &(mfrc522.uid)) != MFRC522::STATUS_OK) continue;
-          for (byte i = 0; i < 3; i++) { 
-             byte block = sector * 4 + i;
-             byte temp[18]; byte size = sizeof(temp);
-             if (mfrc522.MIFARE_Read(block, temp, &size) == MFRC522::STATUS_OK) {
-                for (byte j = 0; j < 16; j++) if (index < maxLen) buffer[index++] = temp[j];
-             }
-          }
-      }
-      mfrc522.PCD_StopCrypto1();
   }
 }
 
@@ -119,22 +141,20 @@ void loop() {
   if (!mfrc522.PICC_IsNewCardPresent()) return;
   if (!mfrc522.PICC_ReadCardSerial()) return;
 
-  // Prioridad 1: Intentar hablar con Android
+  // 1. Celular
   if (tryAndroidHCE()) {
      mfrc522.PICC_HaltA();
-     delay(2000); // Espera larga para no leer muchas veces
+     delay(2000);
      return;
   }
 
-  // Prioridad 2: Si falló, es tarjeta física
+  // 2. Tarjeta Física
   String uid = "";
   for (byte i = 0; i < mfrc522.uid.size; i++) {
     if (mfrc522.uid.uidByte[i] < 0x10) uid += "0";
     uid += String(mfrc522.uid.uidByte[i], HEX);
   }
   uid.toUpperCase();
-  
-  // Imprimimos UID solo si NO es Android (para no duplicar)
   Serial.print("UID:"); Serial.println(uid);
 
   byte rawBuffer[512]; int rawIndex = 0;
